@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  db_worktimebot:
+    container_name: db_worktimebot
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: worktimebot
+      POSTGRES_DB: worktimebot
+    image: postgres:16.13-alpine3.23
