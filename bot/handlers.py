@@ -2,7 +2,7 @@ from aiogram import Router
 from aiogram.types import Message
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from services.sheets import save_to_sheets
+from services.db import save_to_db
 
 from bot.states import WorkState
 
@@ -130,12 +130,13 @@ async def handle_expense_amount(message: Message, state: FSMContext):
 @router.message(WorkState.confirm)
 async def handle_confirm(message: Message, state: FSMContext):
     text = message.text.lower()
+    data = await state.get_data()
+
+    name = message.from_user.full_name
+    chat_id = message.from_user.id
 
     if text == "да":
-        data = await state.get_data()
-
-        name = message.from_user.full_name
-        save_to_sheets(data, name)
+        save_to_db(data, name, chat_id)
 
         await message.answer("Сохранено в Google Sheets ✅")
 

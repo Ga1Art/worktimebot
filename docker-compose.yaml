@@ -10,3 +10,9 @@ services:
       POSTGRES_PASSWORD: worktimebot
       POSTGRES_DB: worktimebot
     image: postgres:16.13-alpine3.23
+  bot:
+    build: .
+    container_name: worktime_bot
+    restart: always
+    env_file:
+      - .env
