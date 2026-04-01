@@ -8,6 +8,8 @@ from config import BOT_TOKEN, API_KEY
 from bot.handlers import router
 from api_con import get_connection
 
+print("BOT STARTED")
+
 logging.basicConfig(level=logging.INFO)
 
 # Telegram bot
