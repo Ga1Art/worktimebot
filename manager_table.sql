@@ -1,23 +1,27 @@
--- Удаляем старый VIEW если есть
 DROP VIEW IF EXISTS manager_table;
 
 CREATE VIEW manager_table AS
-WITH work_hours AS (
+WITH report_month AS (
     SELECT
-        w.id AS worker_id,
-        EXTRACT(DAY FROM wl.work_date) AS day,
-        SUM(wl.hours) AS hours,
-        wl.work_type
-    FROM workers w
-    LEFT JOIN work_logs wl ON w.id = wl.worker_id
-    GROUP BY w.id, day, wl.work_type
+        date_trunc('month', CURRENT_DATE)::date AS month_start,
+        (date_trunc('month', CURRENT_DATE) + INTERVAL '1 month')::date AS next_month_start
 ),
-
--- агрегируем часы по дням (1–31)
+approved_workers AS (
+    SELECT id, full_name, chat_id, active
+    FROM workers
+    WHERE is_approved = true
+),
+rates_max AS (
+    SELECT
+        worker_id,
+        work_type,
+        MAX(rate_per_hour) AS rate_per_hour
+    FROM rates
+    GROUP BY worker_id, work_type
+),
 pivot_hours AS (
     SELECT
         wl.worker_id,
-
         SUM(CASE WHEN EXTRACT(DAY FROM wl.work_date) = 1 THEN wl.hours ELSE 0 END) AS d1,
         SUM(CASE WHEN EXTRACT(DAY FROM wl.work_date) = 2 THEN wl.hours ELSE 0 END) AS d2,
         SUM(CASE WHEN EXTRACT(DAY FROM wl.work_date) = 3 THEN wl.hours ELSE 0 END) AS d3,
@@ -49,58 +53,60 @@ pivot_hours AS (
         SUM(CASE WHEN EXTRACT(DAY FROM wl.work_date) = 29 THEN wl.hours ELSE 0 END) AS d29,
         SUM(CASE WHEN EXTRACT(DAY FROM wl.work_date) = 30 THEN wl.hours ELSE 0 END) AS d30,
         SUM(CASE WHEN EXTRACT(DAY FROM wl.work_date) = 31 THEN wl.hours ELSE 0 END) AS d31
-
     FROM work_logs wl
+    CROSS JOIN report_month rm
+    WHERE wl.work_date >= rm.month_start
+      AND wl.work_date < rm.next_month_start
     GROUP BY wl.worker_id
 ),
-
--- считаем зарплату по ставкам
 salary_calc AS (
     SELECT
         wl.worker_id,
-        SUM(
-            wl.hours * r.rate_per_hour
-        ) AS salary
+        SUM(wl.hours * COALESCE(rm.rate_per_hour, 0)) AS salary
     FROM work_logs wl
-    LEFT JOIN rates r
-        ON wl.worker_id = r.worker_id
-        AND wl.work_type = r.work_type
+    CROSS JOIN report_month period
+    LEFT JOIN rates_max rm
+        ON wl.worker_id = rm.worker_id
+        AND wl.work_type = rm.work_type
+    WHERE wl.work_date >= period.month_start
+      AND wl.work_date < period.next_month_start
     GROUP BY wl.worker_id
 ),
-
--- расходы
 expenses_sum AS (
     SELECT
-        worker_id,
-        SUM(amount) AS total_expenses
-    FROM expenses
-    GROUP BY worker_id
+        e.worker_id,
+        SUM(e.amount) AS total_expenses
+    FROM expenses e
+    CROSS JOIN report_month rm
+    WHERE e.expense_date >= rm.month_start
+      AND e.expense_date < rm.next_month_start
+      AND e.status = 'approved'
+    GROUP BY e.worker_id
 ),
-
--- премии
 bonuses_sum AS (
     SELECT
-        worker_id,
-        SUM(amount) AS total_bonuses
-    FROM bonuses
-    GROUP BY worker_id
+        b.worker_id,
+        SUM(b.amount) AS total_bonuses
+    FROM bonuses b
+    CROSS JOIN report_month rm
+    WHERE b.bonus_date >= rm.month_start
+      AND b.bonus_date < rm.next_month_start
+    GROUP BY b.worker_id
 ),
-
--- штрафы
 penalties_sum AS (
     SELECT
-        worker_id,
-        SUM(amount) AS total_penalties
-    FROM penalties
-    GROUP BY worker_id
+        p.worker_id,
+        SUM(p.amount) AS total_penalties
+    FROM penalties p
+    CROSS JOIN report_month rm
+    WHERE p.penalty_date >= rm.month_start
+      AND p.penalty_date < rm.next_month_start
+    GROUP BY p.worker_id
 )
-
 SELECT
     w.full_name,
     w.chat_id,
     w.active,
-
-    -- дни
     COALESCE(p.d1, 0) AS d1,
     COALESCE(p.d2, 0) AS d2,
     COALESCE(p.d3, 0) AS d3,
@@ -132,32 +138,25 @@ SELECT
     COALESCE(p.d29, 0) AS d29,
     COALESCE(p.d30, 0) AS d30,
     COALESCE(p.d31, 0) AS d31,
-
-    -- финансы
     COALESCE(s.salary, 0) AS base_salary,
     COALESCE(b.total_bonuses, 0) AS bonuses,
     COALESCE(pn.total_penalties, 0) AS penalties,
     COALESCE(e.total_expenses, 0) AS expenses,
-
-    -- итог
     (
         COALESCE(s.salary, 0)
         + COALESCE(b.total_bonuses, 0)
+        + COALESCE(e.total_expenses, 0)
         - COALESCE(pn.total_penalties, 0)
-        - COALESCE(e.total_expenses, 0)
     ) AS total,
-
-    -- итог с налогом (13%)
     (
         (
             COALESCE(s.salary, 0)
             + COALESCE(b.total_bonuses, 0)
+            + COALESCE(e.total_expenses, 0)
             - COALESCE(pn.total_penalties, 0)
-            - COALESCE(e.total_expenses, 0)
-        ) * 0.87
+        ) * 1.06
     ) AS total_with_tax
-
-FROM workers w
+FROM approved_workers w
 LEFT JOIN pivot_hours p ON w.id = p.worker_id
 LEFT JOIN salary_calc s ON w.id = s.worker_id
 LEFT JOIN expenses_sum e ON w.id = e.worker_id

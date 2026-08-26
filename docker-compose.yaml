@@ -1,18 +1,30 @@
-version: '3.8'
-
 services:
-  db_worktimebot:
-    container_name: db_worktimebot
-    ports:
-      - "5432:5432"
-    environment:
-      POSTGRES_USER: admin
-      POSTGRES_PASSWORD: worktimebot
-      POSTGRES_DB: worktimebot
-    image: postgres:16.13-alpine3.23
   bot:
     build: .
     container_name: worktime_bot
     restart: always
     env_file:
       - .env
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./service-account.json:/app/service-account.json:ro
+      - ./storage:/app/storage
+    command: python main.py
+
+  vk_bot:
+    build: .
+    container_name: worktime_vk_bot
+    restart: always
+    env_file:
+      - .env
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    volumes:
+      - ./service-account.json:/app/service-account.json:ro
+      - ./storage:/app/storage
+    command: python vk_bot_start.py

@@ -4,7 +4,8 @@ CREATE TABLE workers (
   full_name TEXT NOT NULL,
   chat_id BIGINT UNIQUE,
   is_approved BOOLEAN DEFAULT false,
-  active BOOLEAN DEFAULT true
+  active BOOLEAN DEFAULT true,
+  is_admin BOOLEAN DEFAULT false
 );
 
 -- 💰 ставки (разные для shift/install)
