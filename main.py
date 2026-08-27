@@ -27,6 +27,8 @@ from services.db import get_connection
 from services.reporting import build_monthly_report
 from services.runtime_lock import TELEGRAM_RUNTIME_LOCK
 
+print("BOT STARTED")
+
 logging.basicConfig(level=logging.INFO)
 
 telegram_bot: Bot | None = None
