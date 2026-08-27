@@ -377,11 +377,24 @@ class ReplayTelegramMessage:
         return await self.bot.send_message(self.chat.id, text, **kwargs)
 
 
+def telegram_user_id_from_state_key(user_key) -> int:
+    raw_key = str(user_key or "").strip()
+    if raw_key.isdigit():
+        return int(raw_key)
+
+    parts = raw_key.split(":")
+    if len(parts) >= 3 and parts[2].isdigit():
+        return int(parts[2])
+
+    raise ValueError(f"Unsupported Telegram state user key: {raw_key!r}")
+
+
 async def auto_replay_pending_telegram_message(bot_instance, row: dict):
-    user_id = int(row["user_key"])
     if not row:
-        logger.info("Telegram startup replay: no replay row for user %s", user_id)
+        logger.info("Telegram startup replay: no replay row")
         return
+
+    user_id = telegram_user_id_from_state_key(row["user_key"])
 
     if row.get("state") == "waiting_expense_receipt" and row.get("has_media"):
         logger.info(
@@ -425,7 +438,7 @@ async def auto_replay_pending_telegram_message(bot_instance, row: dict):
 
 
 async def send_telegram_state_reminder(bot_instance, row: dict):
-    user_id = int(row["user_key"])
+    user_id = telegram_user_id_from_state_key(row["user_key"])
     state_name = row.get("state")
     if not state_name:
         return
