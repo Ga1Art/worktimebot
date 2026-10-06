@@ -3,6 +3,8 @@ import asyncio
 import json
 import logging
 import time
+import socket
+import ssl
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -28,8 +30,21 @@ def fetch_projects():
                 data = json.load(response)
         except HTTPError as exc:
             raise RuntimeError(f"Yougile: HTTP {exc.code}") from None
-        except (URLError, ValueError) as exc:
-            raise RuntimeError("Не удалось загрузить проекты Yougile.") from None
+        except URLError as exc:
+            reason = exc.reason
+            if isinstance(reason, socket.gaierror):
+                detail = "не удалось определить IP-адрес сервера (DNS)"
+            elif isinstance(reason, ssl.SSLError):
+                detail = "ошибка проверки TLS/SSL-соединения"
+            elif isinstance(reason, TimeoutError):
+                detail = "истекло время ожидания соединения"
+            else:
+                detail = f"ошибка соединения ({type(reason).__name__})"
+            raise RuntimeError(f"Не удалось загрузить проекты Yougile: {detail}.") from None
+        except TimeoutError:
+            raise RuntimeError("Yougile: истекло время ожидания ответа сервера.") from None
+        except ValueError:
+            raise RuntimeError("Yougile вернул некорректный JSON. Проверьте адрес API: нужен адрес, заканчивающийся на /api-v2.") from None
         if not isinstance(data, dict) or not isinstance(data.get("content"), list):
             raise RuntimeError("Неожиданный формат списка проектов Yougile.")
         page = data["content"]

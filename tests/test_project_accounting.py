@@ -3,6 +3,8 @@ import ast
 import importlib.util
 import io
 import json
+import socket
+from urllib.error import URLError
 from datetime import date
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -129,6 +131,16 @@ class SyncTests(unittest.TestCase):
     def test_bad_response_is_rejected(self):
         with patch.object(yougile, 'urlopen', return_value=io.BytesIO(b'{"error":"bad"}')):
             with self.assertRaises(RuntimeError):
+                yougile.fetch_projects()
+
+    def test_dns_error_is_identified(self):
+        with patch.object(yougile, 'urlopen', side_effect=URLError(socket.gaierror(-2, 'DNS failure'))):
+            with self.assertRaisesRegex(RuntimeError, 'DNS'):
+                yougile.fetch_projects()
+
+    def test_non_json_response_has_actionable_error(self):
+        with patch.object(yougile, 'urlopen', return_value=io.BytesIO(b'<html>Login</html>')):
+            with self.assertRaisesRegex(RuntimeError, 'JSON'):
                 yougile.fetch_projects()
 
     def test_download_failure_does_not_touch_database(self):
