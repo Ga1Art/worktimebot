@@ -312,10 +312,8 @@ def admin_menu_keyboard():
             [BTN_ADD, BTN_STATS],
             [BTN_LOGS, BTN_EXPENSES],
             [BTN_MY_ID, BTN_LINK_TELEGRAM, BTN_PAST_MONTH],
-            [BTN_ADMIN_USERS, BTN_ADMIN_EXPENSES],
-            [BTN_ADMIN_WORKERS, BTN_ADMIN_SHOW_RATES, BTN_ADMIN_SHOW_PROJECTS],
-            ["Обновить проекты Yougile"],
-            ["Заявки за прошлый месяц"],
+            [BTN_ADMIN_USERS, BTN_ADMIN_EXPENSES, "Заявки за прошлый месяц"],
+            [BTN_ADMIN_WORKERS, BTN_ADMIN_SHOW_RATES, BTN_ADMIN_SHOW_PROJECTS, "Обновить проекты Yougile"],
             [BTN_ADMIN_SET_RATE, BTN_ADMIN_ADD_BONUS],
             [BTN_ADMIN_ADD_PENALTY, BTN_ADMIN_SHOW_BONUSES],
             [BTN_ADMIN_SHOW_PENALTIES, BTN_ADMIN_MERGE],
@@ -371,10 +369,8 @@ def back_to_menu_keyboard(vk_id: int):
 def admin_shortcuts_keyboard():
     return build_keyboard(
         [
-            [BTN_ADMIN_USERS, BTN_ADMIN_EXPENSES],
-            [BTN_ADMIN_WORKERS, BTN_ADMIN_SHOW_RATES, BTN_ADMIN_SHOW_PROJECTS],
-            ["Обновить проекты Yougile"],
-            ["Заявки за прошлый месяц"],
+            [BTN_ADMIN_USERS, BTN_ADMIN_EXPENSES, "Заявки за прошлый месяц"],
+            [BTN_ADMIN_WORKERS, BTN_ADMIN_SHOW_RATES, BTN_ADMIN_SHOW_PROJECTS, "Обновить проекты Yougile"],
             [BTN_ADMIN_SET_RATE, BTN_ADMIN_ADD_BONUS],
             [BTN_ADMIN_ADD_PENALTY, BTN_ADMIN_SHOW_BONUSES],
             [BTN_ADMIN_SHOW_PENALTIES, BTN_ADMIN_MERGE],
@@ -3006,10 +3002,8 @@ def admin_menu_keyboard():
             [BTN_ADD, BTN_STATS],
             [BTN_LOGS, BTN_EXPENSES],
             [BTN_MY_ID, BTN_LINK_TELEGRAM, BTN_PAST_MONTH],
-            [BTN_ADMIN_USERS, BTN_ADMIN_EXPENSES],
-            [BTN_ADMIN_WORKERS, BTN_ADMIN_SHOW_RATES, BTN_ADMIN_SHOW_PROJECTS],
-            ["Обновить проекты Yougile"],
-            ["Заявки за прошлый месяц"],
+            [BTN_ADMIN_USERS, BTN_ADMIN_EXPENSES, "Заявки за прошлый месяц"],
+            [BTN_ADMIN_WORKERS, BTN_ADMIN_SHOW_RATES, BTN_ADMIN_SHOW_PROJECTS, "Обновить проекты Yougile"],
             [BTN_ADMIN_SET_RATE, BTN_ADMIN_ADD_BONUS],
             [BTN_ADMIN_ADD_PENALTY, BTN_ADMIN_SHOW_BONUSES],
             [BTN_ADMIN_SHOW_PENALTIES, BTN_ADMIN_MERGE],
@@ -3022,10 +3016,8 @@ def admin_menu_keyboard():
 def admin_shortcuts_keyboard():
     return build_keyboard(
         [
-            [BTN_ADMIN_USERS, BTN_ADMIN_EXPENSES],
-            [BTN_ADMIN_WORKERS, BTN_ADMIN_SHOW_RATES, BTN_ADMIN_SHOW_PROJECTS],
-            ["Обновить проекты Yougile"],
-            ["Заявки за прошлый месяц"],
+            [BTN_ADMIN_USERS, BTN_ADMIN_EXPENSES, "Заявки за прошлый месяц"],
+            [BTN_ADMIN_WORKERS, BTN_ADMIN_SHOW_RATES, BTN_ADMIN_SHOW_PROJECTS, "Обновить проекты Yougile"],
             [BTN_ADMIN_SET_RATE, BTN_ADMIN_ADD_BONUS],
             [BTN_ADMIN_ADD_PENALTY, BTN_ADMIN_SHOW_BONUSES],
             [BTN_ADMIN_SHOW_PENALTIES, BTN_ADMIN_MERGE],
