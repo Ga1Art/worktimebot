@@ -1,7 +1,8 @@
-﻿import asyncio
+import asyncio
 import logging
 import random
 import time
+import uuid
 from calendar import monthrange
 from datetime import date
 
@@ -34,7 +35,10 @@ from bot.core.dedup import mark_and_check_duplicate, vk_message_key
 from bot.core.outgoing_dedup import build_outgoing_key, should_skip_outgoing
 from bot.core.notifications import notify_expense_origin, notify_worker, send_telegram_media, send_telegram_message, send_vk_media, send_vk_message
 from bot.pending_views import build_pending_expenses_overview_text, build_pending_users_overview_text
-from bot.past_month_requests import format_past_month_request
+from bot.past_month_requests import (
+    format_saved_request, telegram_request_keyboard, vk_request_keyboard, process_request_decision,
+)
+from services.past_month_requests import create_request, list_pending_requests
 from bot.shared_text import (
     format_active_workers as shared_format_active_workers,
     format_adjustments as shared_format_adjustments,
@@ -81,6 +85,7 @@ from services.db import (
 from services.google_sheets import google_error_message, sync_monthly_report_to_current_sheet, sync_projects_reference_sheet
 from services.monthly_closing import close_month_tracked, parse_previous_month_date
 from services.receipts import save_remote_receipt
+from services.yougile import sync_projects
 
 
 user_states = {}
@@ -170,7 +175,7 @@ def format_pending_users(rows):
     return shared_format_pending_users(rows, missing_chat_text='нет Telegram chat_id')
 
 
-def format_expense_admin_text(full_name: str, expense_date, amount, description: str, has_receipt: bool):
+def format_expense_admin_text(full_name: str, expense_date, amount, description: str, has_receipt: bool, *, project_name=None):
     return shared_format_expense_admin_text(
         full_name,
         expense_date,
@@ -178,6 +183,7 @@ def format_expense_admin_text(full_name: str, expense_date, amount, description:
         description,
         has_receipt,
         source_label="VK",
+        project_name=project_name,
     )
 
 
@@ -308,6 +314,8 @@ def admin_menu_keyboard():
             [BTN_MY_ID, BTN_LINK_TELEGRAM, BTN_PAST_MONTH],
             [BTN_ADMIN_USERS, BTN_ADMIN_EXPENSES],
             [BTN_ADMIN_WORKERS, BTN_ADMIN_SHOW_RATES, BTN_ADMIN_SHOW_PROJECTS],
+            ["Обновить проекты Yougile"],
+            ["Заявки за прошлый месяц"],
             [BTN_ADMIN_SET_RATE, BTN_ADMIN_ADD_BONUS],
             [BTN_ADMIN_ADD_PENALTY, BTN_ADMIN_SHOW_BONUSES],
             [BTN_ADMIN_SHOW_PENALTIES, BTN_ADMIN_MERGE],
@@ -365,6 +373,8 @@ def admin_shortcuts_keyboard():
         [
             [BTN_ADMIN_USERS, BTN_ADMIN_EXPENSES],
             [BTN_ADMIN_WORKERS, BTN_ADMIN_SHOW_RATES, BTN_ADMIN_SHOW_PROJECTS],
+            ["Обновить проекты Yougile"],
+            ["Заявки за прошлый месяц"],
             [BTN_ADMIN_SET_RATE, BTN_ADMIN_ADD_BONUS],
             [BTN_ADMIN_ADD_PENALTY, BTN_ADMIN_SHOW_BONUSES],
             [BTN_ADMIN_SHOW_PENALTIES, BTN_ADMIN_MERGE],
@@ -403,14 +413,14 @@ def pending_state_hint(state_name: str | None) -> str:
         "waiting_for_full_name": "Ожидаю ваше полное имя.",
         "confirming_name": "Используйте кнопки Подтвердить или Отменить.",
         "waiting_date": "Ожидаю число месяца от 1 до 31, например: 14.",
-        "waiting_project": "Выберите проект кнопкой или введите его название вручную.",
+        "waiting_project": "Выберите проект кнопкой из справочника.",
         "waiting_hours": "Ожидаю количество часов числом, например: 8 или 7.5.",
         "waiting_expense_type": "Ожидаю короткое описание расхода.",
         "waiting_expense_amount": "Ожидаю сумму числом, например: 1500 или 1500.50.",
         "waiting_expense_receipt": "Ожидаю фото или файл чека.",
         "waiting_past_month_date": "Ожидаю полную дату из прошлого месяца в формате ДД.ММ.ГГГГ.",
         "waiting_past_month_type": "Выберите тип записи кнопками ниже.",
-        "waiting_past_month_project": "Выберите проект кнопкой или введите его название вручную.",
+        "waiting_past_month_project": "Выберите проект кнопкой из справочника.",
         "waiting_past_month_hours": "Ожидаю количество часов числом.",
         "waiting_past_month_expense_description": "Ожидаю краткое описание расхода.",
         "waiting_past_month_expense_amount": "Ожидаю сумму расхода числом.",
@@ -852,7 +862,7 @@ async def start_past_month_entry(message: MessagesMessage):
         await reply(message, error_text, keyboard=start_choice_keyboard())
         return
 
-    set_user_state(message.from_id, "waiting_past_month_date", {"worker_id": worker_id})
+    set_user_state(message.from_id, "waiting_past_month_date", {"worker_id": worker_id, "past_request_key": str(uuid.uuid4())})
     await reply(
         message,
         'Введите полную дату из прошлого месяца в формате ДД.ММ.ГГГГ.\nНапример: 28.06.2026',
@@ -864,20 +874,14 @@ async def send_past_month_request_to_admins(message: MessagesMessage, state_data
     worker_id = state_data["worker_id"]
     worker = await run_sync(get_worker_by_id, worker_id)
     full_name = worker[1] if worker else f"ID {worker_id}"
-    request_text = format_past_month_request(
-        full_name=full_name,
-        worker_id=worker_id,
-        request_date=state_data["request_date"],
-        entry_type=state_data["entry_type"],
-        source_label="VK",
-        project_name=state_data.get("project"),
-        hours=state_data.get("hours"),
-        expense_description=state_data.get("expense_type"),
-        expense_amount=state_data.get("amount"),
-    )
-    await send_telegram_message(ADMIN_CHAT_ID, request_text)
-    for admin_vk_id in get_admin_vk_ids():
-        await send_vk_message(admin_vk_id, request_text)
+    submission_key = state_data.get('past_request_key') or str(uuid.uuid4())
+    state_data = dict(state_data, past_request_key=submission_key)
+    set_user_state(message.from_id, 'confirm_past_month', state_data)
+    request = await run_sync(create_request, state_data, worker_id, full_name, submission_key, 'vk', message.peer_id)
+    request_text = format_saved_request(request)
+    await send_telegram_message(ADMIN_CHAT_ID, request_text, reply_markup=telegram_request_keyboard(request['id']))
+    for admin_vk_id in await run_sync(get_admin_vk_ids):
+        await send_vk_message(admin_vk_id, request_text, keyboard=vk_request_keyboard(request['id']))
 
 
 async def handle_existing_link(message: MessagesMessage):
@@ -1333,6 +1337,28 @@ def set_vk_bot(vk_bot_instance: Bot):
             await handle_start_message(message)
             return
 
+        if text in {normalize_text('/past_requests'), normalize_text('Заявки за прошлый месяц')}:
+            if not await run_sync(is_admin_by_vk_id, message.from_id):
+                return
+            requests = await run_sync(list_pending_requests)
+            if not requests:
+                await reply(message, 'Нет заявок за прошлый месяц, ожидающих решения.')
+            for request in requests:
+                await reply(message, format_saved_request(request), keyboard=vk_request_keyboard(request['id']))
+            return
+
+        if text.startswith(('одобрить заявку #', 'отклонить заявку #')):
+            if not await run_sync(is_admin_by_vk_id, message.from_id):
+                return
+            try:
+                request_id = int(text.rsplit('#', 1)[1])
+                result_text = await process_request_decision(request_id, text.startswith('одобрить'), f'vk:{message.from_id}')
+            except ValueError as exc:
+                await reply(message, str(exc))
+                return
+            await reply(message, result_text)
+            return
+
         if text in {normalize_text(BTN_ADD)}:
             await add_handler(message)
             return
@@ -1417,6 +1443,22 @@ def set_vk_bot(vk_bot_instance: Bot):
             if not is_admin_by_vk_id(message.from_id):
                 return
             await reply(message, await run_sync(get_active_projects_text_result), keyboard=admin_shortcuts_keyboard())
+            return
+
+        if text in {normalize_text("/sync_projects"), normalize_text("Обновить проекты Yougile")}:
+            if not await run_sync(is_admin_by_vk_id, message.from_id):
+                return
+            try:
+                result = await run_sync(sync_projects)
+            except ValueError as exc:
+                await reply(message, str(exc))
+                return
+            except Exception:
+                logger.exception("Yougile sync requested by VK administrator failed")
+                await reply(message, "Не удалось обновить проекты Yougile. Локальный справочник сохранён.")
+                return
+            clear_active_projects_cache()
+            await reply(message, f"Проекты Yougile обновлены: {result['synced']}.", keyboard=admin_shortcuts_keyboard())
             return
 
         if text in {normalize_text(BTN_ADMIN_ADD_PROJECT)}:
@@ -2303,12 +2345,12 @@ def set_vk_bot(vk_bot_instance: Bot):
                 project_rows = await run_sync(get_active_projects_cached)
                 set_user_meta(message.from_id, "project_picker_page", 0)
                 if not project_rows:
-                    next_data["manual_project_entry"] = True
+                    next_data["manual_project_entry"] = False
                     set_user_state(message.from_id, "waiting_past_month_project", next_data)
-                    await reply(message, 'Сейчас нет активных проектов. Введите название проекта вручную.', keyboard=input_step_keyboard())
+                    await reply(message, 'Нет активных проектов. Обратитесь к администратору.', keyboard=input_step_keyboard())
                     return
                 set_user_state(message.from_id, "waiting_past_month_project", next_data)
-                await reply(message, 'Для монтажа выберите проект кнопкой ниже.', keyboard=project_picker_keyboard(project_rows, page=0, mode="pick"))
+                await reply(message, 'Выберите проект кнопкой ниже.', keyboard=project_picker_keyboard(project_rows, page=0, mode="pick"))
                 return
 
             if entry_type == "shift":
@@ -2316,8 +2358,14 @@ def set_vk_bot(vk_bot_instance: Bot):
                 await reply(message, 'Укажите количество часов по смене.', keyboard=input_step_keyboard())
                 return
 
-            set_user_state(message.from_id, "waiting_past_month_expense_description", next_data)
-            await reply(message, 'Напишите краткое описание расхода.', keyboard=input_step_keyboard())
+            project_rows = await run_sync(get_active_projects_cached)
+            if not project_rows:
+                await reply(message, 'Нет активных проектов. Обратитесь к администратору.', keyboard=past_month_type_keyboard())
+                return
+            next_data["project_id"] = None
+            set_user_meta(message.from_id, "project_picker_page", 0)
+            set_user_state(message.from_id, "waiting_past_month_project", next_data)
+            await reply(message, 'Выберите проект для расхода.', keyboard=project_picker_keyboard(project_rows))
             return
 
         if state == "waiting_past_month_project":
@@ -2340,7 +2388,7 @@ def set_vk_bot(vk_bot_instance: Bot):
             if text == normalize_text(BTN_PROJECTS_PREV):
                 current_page = max(0, current_page - 1)
                 set_user_meta(message.from_id, "project_picker_page", current_page)
-                await reply(message, 'Для монтажа выберите проект кнопкой ниже.', keyboard=project_picker_keyboard(project_rows, page=current_page, mode="pick"))
+                await reply(message, 'Выберите проект кнопкой ниже.', keyboard=project_picker_keyboard(project_rows, page=current_page, mode="pick"))
                 return
 
             if text == normalize_text(BTN_PROJECTS_NEXT):
@@ -2348,34 +2396,30 @@ def set_vk_bot(vk_bot_instance: Bot):
                 max_page = max(0, (len(project_rows) - 1) // page_size) if project_rows else 0
                 current_page = min(max_page, current_page + 1)
                 set_user_meta(message.from_id, "project_picker_page", current_page)
-                await reply(message, 'Для монтажа выберите проект кнопкой ниже.', keyboard=project_picker_keyboard(project_rows, page=current_page, mode="pick"))
+                await reply(message, 'Выберите проект кнопкой ниже.', keyboard=project_picker_keyboard(project_rows, page=current_page, mode="pick"))
                 return
 
             if text == normalize_text(BTN_PROJECT_OTHER):
-                next_data["manual_project_entry"] = True
-                set_user_state(message.from_id, "waiting_past_month_project", next_data)
-                await reply(message, 'Введите название проекта вручную.', keyboard=input_step_keyboard())
+                await reply(message, "Выберите проект из справочника. Новый проект добавляет администратор.", keyboard=project_picker_keyboard(project_rows, page=current_page))
                 return
 
-            if next_data.get("manual_project_entry"):
-                project_name = text_raw.strip()
-                if not project_name:
-                    await reply(message, 'Введите, пожалуйста, название проекта или объекта монтажа.', keyboard=input_step_keyboard())
-                    return
-                next_data["project"] = project_name
-            else:
-                selected = None
-                for _, project_name in project_rows:
-                    if normalize_text(project_name) == text:
-                        selected = project_name
-                        break
-                if not selected:
-                    await reply(message, 'Для монтажа выберите проект кнопкой ниже.', keyboard=project_picker_keyboard(project_rows, page=current_page, mode="pick"))
-                    return
-                next_data["project"] = selected
+            selected = None
+            for selected_id, project_name in project_rows:
+                if normalize_text(project_name) == text:
+                    next_data["project_id"] = selected_id
+                    selected = project_name
+                    break
+            if not selected:
+                await reply(message, 'Выберите проект кнопкой ниже.', keyboard=project_picker_keyboard(project_rows, page=current_page))
+                return
+            next_data["project"] = selected
 
             next_data["manual_project_entry"] = False
             clear_user_meta(message.from_id, "project_picker_page")
+            if next_data.get("entry_type") == "expense":
+                set_user_state(message.from_id, "waiting_past_month_expense_description", next_data)
+                await reply(message, "Напишите краткое описание расхода.", keyboard=input_step_keyboard())
+                return
             set_user_state(message.from_id, "waiting_past_month_hours", next_data)
             await reply(message, 'Укажите количество часов по этому монтажу.', keyboard=input_step_keyboard())
             return
@@ -2468,6 +2512,7 @@ def set_vk_bot(vk_bot_instance: Bot):
                 'Проверьте запрос перед отправкой администратору:',
                 f"Дата: {request_date:%d.%m.%Y}",
                 'Тип записи: Расход',
+                f"Проект: {state_data.get('project')}",
                 f"Описание расхода: {state_data['expense_type']}",
                 f"Сумма: {amount}",
             ]
@@ -2489,12 +2534,16 @@ def set_vk_bot(vk_bot_instance: Bot):
                 await reply(message, 'Используйте кнопки Подтвердить или Отменить.', keyboard=confirm_keyboard())
                 return
 
+            try:
+                await send_past_month_request_to_admins(message, state_data)
+            except ValueError as exc:
+                await reply(message, str(exc), keyboard=input_step_keyboard())
+                return
             clear_user_state(message.from_id)
             clear_user_meta(message.from_id, "project_picker_page")
-            await send_past_month_request_to_admins(message, state_data)
             await reply(
                 message,
-                'Запрос отправлен администраторам. Они внесут данные в архивный лист прошлого месяца вручную.',
+                'Заявка отправлена администраторам. После одобрения данные появятся в базе и архивном отчёте.',
                 keyboard=main_menu_keyboard_for_user(message.from_id),
             )
             return
@@ -2512,7 +2561,7 @@ def set_vk_bot(vk_bot_instance: Bot):
                 return
 
             if text == normalize_text(BTN_PAST_MONTH):
-                set_user_state(message.from_id, "waiting_past_month_date", {"worker_id": worker_id})
+                set_user_state(message.from_id, "waiting_past_month_date", {"worker_id": worker_id, "past_request_key": str(uuid.uuid4())})
                 await reply(
                     message,
                     'Введите полную дату из прошлого месяца в формате ДД.ММ.ГГГГ.\nНапример: 28.06.2026',
@@ -2542,18 +2591,19 @@ def set_vk_bot(vk_bot_instance: Bot):
                 return
 
             next_data = dict(state_data)
+            next_data["project_id"] = None
             if text == normalize_text(BTN_INSTALL):
                 next_data["place"] = 'Монтаж'
                 next_data["manual_project_entry"] = False
                 project_rows = await run_sync(get_active_projects_cached)
                 if not project_rows:
-                    next_data["manual_project_entry"] = True
+                    next_data["manual_project_entry"] = False
                     set_user_state(message.from_id, "waiting_project", next_data)
-                    await reply(message, 'Сейчас нет активных проектов для монтажа. Введите название проекта вручную.', keyboard=build_keyboard([[BTN_CANCEL], [BTN_MENU]]))
+                    await reply(message, 'Нет активных проектов. Обратитесь к администратору.', keyboard=build_keyboard([[BTN_CANCEL], [BTN_MENU]]))
                     return
                 set_user_state(message.from_id, "waiting_project", next_data)
                 set_user_meta(message.from_id, "project_picker_page", 0)
-                await reply(message, 'Для монтажа выберите проект кнопкой ниже.', keyboard=project_picker_keyboard(project_rows, page=0, mode="pick"))
+                await reply(message, 'Выберите проект кнопкой ниже.', keyboard=project_picker_keyboard(project_rows, page=0, mode="pick"))
                 return
 
             if text == normalize_text(BTN_SHIFT):
@@ -2567,8 +2617,14 @@ def set_vk_bot(vk_bot_instance: Bot):
                 next_data["place"] = 'Расходы'
                 next_data["project"] = None
                 next_data["hours"] = None
-                set_user_state(message.from_id, "waiting_expense_type", next_data)
-                await reply(message, 'Напишите краткое описание расхода.', keyboard=build_keyboard([[BTN_CANCEL], [BTN_MENU]]))
+                project_rows = await run_sync(get_active_projects_cached)
+                if not project_rows:
+                    await reply(message, 'Нет активных проектов. Обратитесь к администратору.', keyboard=work_type_keyboard())
+                    return
+                next_data["manual_project_entry"] = False
+                set_user_meta(message.from_id, "project_picker_page", 0)
+                set_user_state(message.from_id, "waiting_project", next_data)
+                await reply(message, 'Выберите проект для расхода.', keyboard=project_picker_keyboard(project_rows))
                 return
 
             await reply(message, 'Выберите тип записи кнопками ниже.', keyboard=work_type_keyboard())
@@ -2588,7 +2644,7 @@ def set_vk_bot(vk_bot_instance: Bot):
             if text == normalize_text(BTN_PROJECTS_PREV):
                 current_page = max(0, current_page - 1)
                 set_user_meta(message.from_id, "project_picker_page", current_page)
-                await reply(message, 'Для монтажа выберите проект кнопкой ниже.', keyboard=project_picker_keyboard(project_rows, page=current_page, mode="pick"))
+                await reply(message, 'Выберите проект кнопкой ниже.', keyboard=project_picker_keyboard(project_rows, page=current_page, mode="pick"))
                 return
 
             if text == normalize_text(BTN_PROJECTS_NEXT):
@@ -2596,34 +2652,30 @@ def set_vk_bot(vk_bot_instance: Bot):
                 max_page = max(0, (len(project_rows) - 1) // page_size) if project_rows else 0
                 current_page = min(max_page, current_page + 1)
                 set_user_meta(message.from_id, "project_picker_page", current_page)
-                await reply(message, 'Для монтажа выберите проект кнопкой ниже.', keyboard=project_picker_keyboard(project_rows, page=current_page, mode="pick"))
+                await reply(message, 'Выберите проект кнопкой ниже.', keyboard=project_picker_keyboard(project_rows, page=current_page, mode="pick"))
                 return
 
             if text == normalize_text(BTN_PROJECT_OTHER):
-                next_data["manual_project_entry"] = True
-                set_user_state(message.from_id, "waiting_project", next_data)
-                await reply(message, 'Введите название проекта вручную.', keyboard=build_keyboard([[BTN_CANCEL], [BTN_MENU]]))
+                await reply(message, "Выберите проект из справочника. Новый проект добавляет администратор.", keyboard=project_picker_keyboard(project_rows, page=current_page))
                 return
 
-            if next_data.get("manual_project_entry"):
-                project_name = text_raw
-                if not project_name:
-                    await reply(message, 'Введите, пожалуйста, название проекта или объекта монтажа.', keyboard=build_keyboard([[BTN_CANCEL], [BTN_MENU]]))
-                    return
-                next_data["project"] = project_name
-            else:
-                selected = None
-                for _, project_name in project_rows:
-                    if normalize_text(project_name) == text:
-                        selected = project_name
-                        break
-                if not selected:
-                    await reply(message, 'Для монтажа выберите проект кнопкой ниже.', keyboard=project_picker_keyboard(project_rows, page=current_page, mode="pick"))
-                    return
-                next_data["project"] = selected
+            selected = None
+            for selected_id, project_name in project_rows:
+                if normalize_text(project_name) == text:
+                    next_data["project_id"] = selected_id
+                    selected = project_name
+                    break
+            if not selected:
+                await reply(message, 'Выберите проект кнопкой ниже.', keyboard=project_picker_keyboard(project_rows, page=current_page))
+                return
+            next_data["project"] = selected
 
             next_data["manual_project_entry"] = False
             clear_user_meta(message.from_id, "project_picker_page")
+            if next_data.get("place") == "Расходы":
+                set_user_state(message.from_id, "waiting_expense_type", next_data)
+                await reply(message, "Напишите краткое описание расхода.", keyboard=input_step_keyboard())
+                return
             set_user_state(message.from_id, "waiting_hours", next_data)
             await reply(message, 'Укажите количество часов по этому монтажу.', keyboard=build_keyboard([[BTN_CANCEL], [BTN_MENU]]))
             return
@@ -2735,6 +2787,7 @@ def set_vk_bot(vk_bot_instance: Bot):
                 'Проверьте данные перед сохранением:',
                 f"Дата: {next_data.get('date')}",
                 f"Тип записи: {next_data.get('place')}",
+                f"Проект: {next_data.get('project')}",
                 f"Описание расхода: {next_data.get('expense_type')}",
                 f"Сумма: {next_data.get('amount')}",
                 f"Чек: {('приложен' if next_data.get('receipt_attachment') else 'без чека')}",
@@ -2802,6 +2855,7 @@ def set_vk_bot(vk_bot_instance: Bot):
                     form_data.get("amount"),
                     form_data.get("expense_type"),
                     bool(saved_receipt or form_data.get("receipt_attachment")),
+                    project_name=form_data.get("project"),
                 )
                 await notify_admins(
                     admin_text + "\n\n"
@@ -2934,9 +2988,6 @@ def project_picker_keyboard(rows, page: int = 0, page_size: int = 6, *, mode: st
         label = project_name if mode == "pick" else f"{project_name} ({project_id})"
         keyboard_rows.append([label])
 
-    if mode == "pick":
-        keyboard_rows.append([BTN_PROJECT_OTHER])
-
     nav_row = []
     if page > 0:
         nav_row.append(BTN_PROJECTS_PREV)
@@ -2957,6 +3008,8 @@ def admin_menu_keyboard():
             [BTN_MY_ID, BTN_LINK_TELEGRAM, BTN_PAST_MONTH],
             [BTN_ADMIN_USERS, BTN_ADMIN_EXPENSES],
             [BTN_ADMIN_WORKERS, BTN_ADMIN_SHOW_RATES, BTN_ADMIN_SHOW_PROJECTS],
+            ["Обновить проекты Yougile"],
+            ["Заявки за прошлый месяц"],
             [BTN_ADMIN_SET_RATE, BTN_ADMIN_ADD_BONUS],
             [BTN_ADMIN_ADD_PENALTY, BTN_ADMIN_SHOW_BONUSES],
             [BTN_ADMIN_SHOW_PENALTIES, BTN_ADMIN_MERGE],
@@ -2971,6 +3024,8 @@ def admin_shortcuts_keyboard():
         [
             [BTN_ADMIN_USERS, BTN_ADMIN_EXPENSES],
             [BTN_ADMIN_WORKERS, BTN_ADMIN_SHOW_RATES, BTN_ADMIN_SHOW_PROJECTS],
+            ["Обновить проекты Yougile"],
+            ["Заявки за прошлый месяц"],
             [BTN_ADMIN_SET_RATE, BTN_ADMIN_ADD_BONUS],
             [BTN_ADMIN_ADD_PENALTY, BTN_ADMIN_SHOW_BONUSES],
             [BTN_ADMIN_SHOW_PENALTIES, BTN_ADMIN_MERGE],

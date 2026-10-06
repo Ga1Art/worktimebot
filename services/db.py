@@ -91,6 +91,9 @@ def _ensure_account_link_codes_table(cursor):
 
 
 def _ensure_expense_receipt_columns(cursor):
+    _ensure_projects_table(cursor)
+    cursor.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS project_id INT REFERENCES active_projects(id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_expenses_project_id ON expenses(project_id)")
     cursor.execute(
         """
         ALTER TABLE expenses
@@ -152,9 +155,12 @@ def _ensure_projects_table(cursor):
         ON active_projects (active, name)
         """
     )
+    cursor.execute("ALTER TABLE active_projects ADD COLUMN IF NOT EXISTS yougile_id TEXT")
+    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_yougile_id ON active_projects(yougile_id)")
 
 
 def _ensure_work_logs_project_link(cursor):
+    cursor.execute("ALTER TABLE work_logs ADD COLUMN IF NOT EXISTS project_name TEXT")
     cursor.execute(
         """
         ALTER TABLE work_logs
@@ -166,6 +172,16 @@ def _ensure_work_logs_project_link(cursor):
         CREATE INDEX IF NOT EXISTS idx_work_logs_project_id
         ON work_logs (project_id)
         """
+    )
+
+
+def backfill_known_project_ids(cursor):
+    cursor.execute(
+        """UPDATE work_logs wl SET project_id = p.id
+           FROM (SELECT MIN(id) AS id, LOWER(TRIM(name)) AS name
+                 FROM active_projects GROUP BY LOWER(TRIM(name)) HAVING COUNT(*) = 1) p
+           WHERE wl.work_type = 'install' AND wl.project_id IS NULL
+             AND LOWER(TRIM(wl.project_name)) = p.name"""
     )
 
 
@@ -1470,6 +1486,7 @@ def get_active_projects_with_stats():
     cursor = conn.cursor()
     _ensure_projects_table(cursor)
     _ensure_work_logs_project_link(cursor)
+    _ensure_expense_receipt_columns(cursor)
 
     cursor.execute(
         """
@@ -1477,7 +1494,10 @@ def get_active_projects_with_stats():
             ap.id,
             ap.name,
             COUNT(DISTINCT wl.worker_id) AS participants_count,
-            COALESCE(SUM(wl.hours), 0) AS total_hours
+            COALESCE(SUM(wl.hours), 0) AS total_hours,
+            (SELECT COALESCE(SUM(e.amount), 0) FROM expenses e WHERE e.project_id = ap.id AND e.status = 'approved'),
+            (SELECT COALESCE(SUM(e.amount), 0) FROM expenses e WHERE e.project_id = ap.id AND e.status = 'pending'),
+            (SELECT COALESCE(SUM(e.amount), 0) FROM expenses e WHERE e.project_id = ap.id AND e.status = 'rejected')
         FROM active_projects ap
         LEFT JOIN work_logs wl
             ON wl.work_type = 'install'
@@ -1486,6 +1506,8 @@ def get_active_projects_with_stats():
                 OR (
                     wl.project_id IS NULL
                     AND LOWER(TRIM(COALESCE(wl.project_name, ''))) = LOWER(TRIM(ap.name))
+                    AND (SELECT COUNT(*) FROM active_projects p2
+                         WHERE LOWER(TRIM(p2.name)) = LOWER(TRIM(wl.project_name))) = 1
                 )
            )
         WHERE ap.active = true
@@ -1620,6 +1642,45 @@ def add_project(name: str):
     backfill_project_links(result[0], result[1])
     conn.close()
     return result
+
+
+def get_project_accounting_report(project_id: int):
+    """Lifetime installation hours and personal expenses, including inactive projects."""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        _ensure_projects_table(cursor)
+        _ensure_work_logs_project_link(cursor)
+        _ensure_expense_receipt_columns(cursor)
+        cursor.execute("SELECT id, name, active, yougile_id FROM active_projects WHERE id = %s", (project_id,))
+        project = cursor.fetchone()
+        if not project:
+            return None
+        cursor.execute(
+            """SELECT w.id, w.full_name, SUM(wl.hours)
+               FROM work_logs wl JOIN workers w ON w.id = wl.worker_id
+               WHERE wl.work_type = 'install' AND (
+                   wl.project_id = %s OR (wl.project_id IS NULL AND LOWER(TRIM(wl.project_name)) = LOWER(TRIM(%s))
+                       AND (SELECT COUNT(*) FROM active_projects p2
+                            WHERE LOWER(TRIM(p2.name)) = LOWER(TRIM(wl.project_name))) = 1))
+               GROUP BY w.id, w.full_name ORDER BY w.full_name, w.id""",
+            (project_id, project[1]),
+        )
+        workers = [{"worker_id": row[0], "name": row[1], "hours": float(row[2] or 0)} for row in cursor.fetchall()]
+        cursor.execute(
+            """SELECT e.id, w.full_name, e.expense_date, e.description, e.amount, e.status, e.receipt_path
+               FROM expenses e JOIN workers w ON w.id = e.worker_id
+               WHERE e.project_id = %s ORDER BY e.expense_date, e.id""", (project_id,),
+        )
+        expenses = [{"id": row[0], "worker": row[1], "date": row[2], "description": row[3],
+                     "amount": float(row[4] or 0), "status": row[5], "has_receipt": bool(row[6])}
+                    for row in cursor.fetchall()]
+        return {"id": project[0], "name": project[1], "active": project[2], "yougile_id": project[3],
+                "installation_hours": sum(w["hours"] for w in workers), "workers": workers, "expenses": expenses,
+                "expense_totals": {status: sum(e["amount"] for e in expenses if e["status"] == status)
+                                   for status in ("approved", "pending", "rejected")}}
+    finally:
+        conn.close()
 
 
 def add_project(name: str, project_id: int | None = None):
@@ -1887,7 +1948,8 @@ def get_pending_expenses():
 
     cursor.execute(
         """
-        SELECT e.id, w.full_name, e.amount, e.description, e.expense_date
+        SELECT e.id, w.full_name, e.amount,
+            e.description || COALESCE(' | Проект: ' || (SELECT p.name FROM active_projects p WHERE p.id = e.project_id), ' | Проект не назначен'), e.expense_date
         FROM expenses e
         JOIN workers w ON e.worker_id = w.id
         WHERE e.status = 'pending'
@@ -1912,7 +1974,7 @@ def get_expense_by_id(expense_id):
             w.full_name,
             w.chat_id,
             e.amount,
-            e.description,
+            e.description || COALESCE(' | Проект: ' || (SELECT p.name FROM active_projects p WHERE p.id = e.project_id), ' | Проект не назначен'),
             e.expense_date,
             e.status,
             e.receipt_path,
@@ -2016,7 +2078,8 @@ def get_worker_expenses(worker_id, year, month):
 
     cursor.execute(
         """
-        SELECT expense_date, amount, description, status, receipt_path
+        SELECT expense_date, amount,
+            description || COALESCE(' | Проект: ' || (SELECT p.name FROM active_projects p WHERE p.id = expenses.project_id), ' | Проект не назначен'), status, receipt_path
         FROM expenses
         WHERE worker_id = %s
           AND EXTRACT(YEAR FROM expense_date) = %s
@@ -2195,15 +2258,25 @@ def save_to_db(data: dict, worker_id: int):
 
     place = data.get("place")
     created_expense_id = None
+    selected_project_id = data.get("project_id")
+    if place in {"Монтаж", "Расходы"}:
+        if selected_project_id is not None:
+            cursor.execute("SELECT id, name FROM active_projects WHERE id = %s AND active = true", (selected_project_id,))
+        else:
+            cursor.execute("SELECT id, name FROM active_projects WHERE active = true AND LOWER(TRIM(name)) = LOWER(TRIM(%s))", (data.get("project") or "",))
+        selected_project = cursor.fetchone()
+        if not selected_project:
+            conn.close()
+            raise ValueError("Выберите активный проект из справочника.")
+        if selected_project:
+            selected_project_id, selected_project_name = selected_project
 
     if place in ["Монтаж", "Смена"]:
         work_type = "install" if place == "Монтаж" else "shift"
         project_name = data.get("project")
-        project_id = None
-        if work_type == "install" and project_name:
-            project = get_active_project_by_name(project_name)
-            if project:
-                project_id = project[0]
+        project_id = selected_project_id if work_type == "install" else None
+        if project_id is not None:
+            project_name = selected_project_name
 
         cursor.execute(
             """
@@ -2223,8 +2296,8 @@ def save_to_db(data: dict, worker_id: int):
     elif place == "Расходы":
         cursor.execute(
             """
-            INSERT INTO expenses (worker_id, expense_date, amount, description, status)
-            VALUES (%s, %s, %s, %s, 'pending')
+            INSERT INTO expenses (worker_id, expense_date, amount, description, project_id, status)
+            VALUES (%s, %s, %s, %s, %s, 'pending')
             RETURNING id
             """,
             (
@@ -2232,6 +2305,7 @@ def save_to_db(data: dict, worker_id: int):
                 work_date,
                 data.get("amount"),
                 data.get("expense_type"),
+                selected_project_id,
             ),
         )
         created_expense_id = cursor.fetchone()[0]

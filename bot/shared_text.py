@@ -123,8 +123,9 @@ def format_worker_rates(worker, rates):
     )
 
 
-def format_expense_admin_text(full_name: str, expense_date, amount, description: str, has_receipt: bool, *, source_label=None):
+def format_expense_admin_text(full_name: str, expense_date, amount, description: str, has_receipt: bool, *, source_label=None, project_name=None):
     receipt_text = "приложен" if has_receipt else "без чека"
+    project_text = f"Проект: {project_name}\n" if project_name else ""
     if source_label:
         return (
             f"Новый расход из {source_label}:\n"
@@ -132,6 +133,7 @@ def format_expense_admin_text(full_name: str, expense_date, amount, description:
             f"Дата: {expense_date}\n"
             f"Сумма: {amount}\n"
             f"Описание: {description}\n"
+            f"{project_text}"
             f"Чек: {receipt_text}"
         )
     return (
@@ -139,6 +141,7 @@ def format_expense_admin_text(full_name: str, expense_date, amount, description:
         f"Дата: {expense_date}\n"
         f"Сумма: {amount}\n"
         f"Описание: {description}\n"
+        f"{project_text}"
         f"Чек: {receipt_text}"
     )
 
@@ -149,6 +152,7 @@ def admin_help_text():
         "/help — показать эту памятку\n"
         "/users — показать активных пользователей с ID\n"
         "/pending_users — показать заявки на регистрацию\n"
+        "/past_requests — заявки на внесение данных за прошлый месяц\n"
         "/approve_user ID — одобрить заявку по ID\n"
         "/reject_user ID — отклонить заявку по ID\n"
         "/pending_expenses — показать расходы на подтверждение\n"
@@ -208,6 +212,7 @@ def vk_help_text(is_admin_user: bool):
                 "",
                 "Команды администратора:",
                 "/pending_users — показать заявки на регистрацию",
+                "/past_requests — заявки на внесение данных за прошлый месяц",
                 "/approve_user ID — одобрить заявку",
                 "/reject_user ID — отклонить заявку",
                 "/pending_expenses — показать расходы на подтверждение",

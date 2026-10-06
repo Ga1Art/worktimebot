@@ -56,19 +56,21 @@ async def send_telegram_media(chat_id: Optional[int], media_kind: str, media: st
     return False
 
 
-async def send_vk_message(vk_id: Optional[int], text: str):
+async def send_vk_message(vk_id: Optional[int], text: str, keyboard=None):
     if not vk_id or vk_bot is None:
         return False
 
-    outgoing_key = build_outgoing_key("vk", vk_id, "message", text=text)
+    outgoing_key = build_outgoing_key("vk", vk_id, "message", text=text, markup=keyboard)
     if should_skip_outgoing(outgoing_key):
         return True
 
     try:
+        keyboard_args = {"keyboard": keyboard} if keyboard is not None else {}
         await vk_bot.api.messages.send(
             peer_id=vk_id,
             message=text,
             random_id=random.randint(1, 2_147_483_647),
+            **keyboard_args,
         )
         return True
     except Exception:

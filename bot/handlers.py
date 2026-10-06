@@ -1,5 +1,6 @@
-﻿import asyncio
+import asyncio
 import logging
+import uuid
 from calendar import monthrange
 from datetime import date
 from io import BytesIO
@@ -37,7 +38,10 @@ from bot.admin_views import (
     get_admin_worker_prompt,
 )
 from bot.pending_views import build_pending_expenses_overview_text, build_pending_users_overview_text
-from bot.past_month_requests import format_past_month_request
+from bot.past_month_requests import (
+    format_saved_request, telegram_request_keyboard, vk_request_keyboard, process_request_decision,
+)
+from services.past_month_requests import create_request, list_pending_requests
 from bot.shared_text import (
     admin_help_text,
     format_active_workers,
@@ -91,6 +95,7 @@ from services.db import (
     save_conversation_state,
     update_expense_receipt,
 )
+from services.yougile import sync_projects
 from bot.core.notifications import (
     notify_expense_origin,
     notify_worker,
@@ -240,6 +245,8 @@ def admin_panel_keyboard():
             InlineKeyboardButton(text='Показать проекты', callback_data="admin_projects"),
             InlineKeyboardButton(text='Добавить проект', callback_data="admin_add_project"),
         ],
+        [InlineKeyboardButton(text='Обновить проекты Yougile', callback_data="admin_sync_projects")],
+        [InlineKeyboardButton(text='Заявки за прошлый месяц', callback_data="admin_past_requests")],
         [
             InlineKeyboardButton(text='Удалить проект', callback_data="admin_delete_project"),
             InlineKeyboardButton(text='Закрыть месяц', callback_data="admin_close_month"),
@@ -274,9 +281,6 @@ def project_picker_keyboard(rows, page: int = 0, page_size: int = 8, *, mode: st
             [InlineKeyboardButton(text=label, callback_data=f"{callback_prefix}_{project_id}_page_{page}")]
         )
 
-    if mode == "pick":
-        keyboard_rows.append([InlineKeyboardButton(text='Другое', callback_data=f"project_other_page_{page}")])
-
     nav_row = []
     if page > 0:
         callback_name = "project_page" if mode == "pick" else "admin_project_page"
@@ -299,14 +303,14 @@ def pending_state_hint(state_name: str | None) -> str:
     leaf = (state_name or "").rsplit(":", 1)[-1]
     hints = {
         "waiting_date": 'Ожидаю число месяца от 1 до 31, например: 14.',
-        "waiting_project": 'Выберите проект кнопкой или введите его название, если включен ручной ввод.',
+        "waiting_project": 'Выберите проект кнопкой из справочника.',
         "waiting_hours": 'Ожидаю количество часов числом, например: 8 или 7.5.',
         "waiting_expense_type": 'Ожидаю короткое описание расхода.',
         "waiting_expense_amount": 'Ожидаю сумму расхода числом, например: 1500 или 1500.50.',
         "waiting_expense_receipt": 'Ожидаю фото или файл чека. Если чека нет, используйте кнопку продолжения без чека.',
         "waiting_past_month_date": 'Ожидаю полную дату из прошлого месяца в формате ДД.ММ.ГГГГ.',
         "waiting_past_month_type": 'Выберите тип записи кнопкой ниже.',
-        "waiting_past_month_project": 'Выберите проект кнопкой ниже или введите его вручную.',
+        "waiting_past_month_project": 'Выберите проект кнопкой из справочника.',
         "waiting_past_month_hours": 'Ожидаю количество часов числом, например: 8 или 7.5.',
         "waiting_past_month_expense_description": 'Ожидаю краткое описание расхода.',
         "waiting_past_month_expense_amount": 'Ожидаю сумму расхода числом, например: 1500 или 1500.50.',
@@ -1220,20 +1224,22 @@ async def send_past_month_request_to_admins(message: Message, state: FSMContext,
     worker = await run_sync(get_worker_by_id, worker_id)
     full_name = worker[1] if worker else message.from_user.full_name
     state_data = await state.get_data()
-    request_text = format_past_month_request(
-        full_name=full_name,
-        worker_id=worker_id,
-        request_date=state_data["request_date"],
-        entry_type=state_data["entry_type"],
-        source_label="Telegram",
-        project_name=state_data.get("project"),
-        hours=state_data.get("hours"),
-        expense_description=state_data.get("expense_type"),
-        expense_amount=state_data.get("amount"),
-    )
-    await send_telegram_message(ADMIN_CHAT_ID, request_text)
+    submission_key = state_data.get('past_request_key') or str(uuid.uuid4())
+    await state.update_data(past_request_key=submission_key)
+    request = await run_sync(create_request, state_data, worker_id, full_name, submission_key, 'telegram', message.chat.id)
+    request_text = format_saved_request(request)
+    await send_telegram_message(ADMIN_CHAT_ID, request_text, reply_markup=telegram_request_keyboard(request['id']))
     for admin_vk_id in await run_sync(get_admin_vk_ids):
-        await send_vk_message(admin_vk_id, request_text)
+        await send_vk_message(admin_vk_id, request_text, keyboard=vk_request_keyboard(request['id']))
+
+
+async def show_past_requests(message: Message):
+    requests = await run_sync(list_pending_requests)
+    if not requests:
+        await message.answer('Нет заявок за прошлый месяц, ожидающих решения.')
+        return
+    for request in requests:
+        await message.answer(format_saved_request(request), reply_markup=telegram_request_keyboard(request['id']))
 
 
 async def send_main_menu_from_callback(callback: CallbackQuery, state: FSMContext):
@@ -1997,6 +2003,28 @@ async def start_handler(message: Message, state: FSMContext):
     await show_main_menu(message, state)
 
 
+@router.message(Command("sync_projects"))
+async def sync_projects_handler(message: Message):
+    if not is_admin_message(message):
+        return
+    try:
+        result = await run_sync(sync_projects)
+    except ValueError as exc:
+        await message.answer(str(exc))
+        return
+    except Exception:
+        logging.exception("Yougile sync requested by administrator failed")
+        await message.answer("Не удалось обновить проекты Yougile. Локальный справочник сохранён.")
+        return
+    await message.answer(f"Проекты Yougile обновлены: {result['synced']}.")
+
+
+@router.message(Command("past_requests"))
+async def past_requests_handler(message: Message):
+    if is_admin_message(message):
+        await show_past_requests(message)
+
+
 @router.message(Command("my_logs"))
 async def my_logs_handler(message: Message):
     worker_id = await get_accessible_worker(message)
@@ -2225,32 +2253,13 @@ async def handle_waiting_place_text(message: Message):
 
 @router.message(WorkState.waiting_project)
 async def handle_project(message: Message, state: FSMContext):
-    state_data = await state.get_data()
-    if state_data.get("manual_project_entry"):
-        project_name = (message.text or "").strip()
-        if not project_name:
-            await message.answer('Введите, пожалуйста, название проекта или объекта монтажа.')
-            return
-
-        await state.update_data(project=project_name, manual_project_entry=False)
-        await state.set_state(WorkState.waiting_hours)
-        await message.answer('Укажите, пожалуйста, количество часов по этому монтажу.')
+    if not is_private(message):
         return
-
     projects = await run_sync(get_active_projects)
     if not projects:
-        await state.set_state(WorkState.waiting_place)
-        await message.answer(
-            'Сейчас нет активных проектов для монтажа.\n'
-            'Обратитесь к администратору или выберите другой тип записи.',
-            reply_markup=work_type_keyboard(),
-        )
+        await message.answer('Нет активных проектов. Обратитесь к администратору.', reply_markup=back_to_menu_keyboard())
         return
-
-    await message.answer(
-        'Для монтажа выберите проект кнопкой ниже.',
-        reply_markup=project_picker_keyboard(projects, page=0, mode="pick"),
-    )
+    await message.answer('Выберите проект кнопкой ниже.', reply_markup=project_picker_keyboard(projects))
 
 
 @router.message(WorkState.waiting_hours)
@@ -2393,32 +2402,11 @@ async def handle_past_month_type(message: Message):
 async def handle_past_month_project(message: Message, state: FSMContext):
     if not is_private(message):
         return
-
-    state_data = await state.get_data()
-    if state_data.get("manual_project_entry"):
-        project_name = (message.text or "").strip()
-        if not project_name:
-            await message.answer('Введите, пожалуйста, название проекта или объекта монтажа.', reply_markup=back_to_menu_keyboard())
-            return
-
-        await state.update_data(project=project_name, standflow_project_id=None, manual_project_entry=False)
-        await state.set_state(WorkState.waiting_past_month_hours)
-        await message.answer('Укажите, пожалуйста, количество часов по этому монтажу.', reply_markup=back_to_menu_keyboard())
-        return
-
     projects = await run_sync(get_active_projects)
     if not projects:
-        await state.update_data(manual_project_entry=True, standflow_project_id=None)
-        await message.answer(
-            'Сейчас нет активных проектов. Введите название проекта вручную.',
-            reply_markup=back_to_menu_keyboard(),
-        )
+        await message.answer('Нет активных проектов. Обратитесь к администратору.', reply_markup=back_to_menu_keyboard())
         return
-
-    await message.answer(
-        'Для монтажа выберите проект кнопкой ниже.',
-        reply_markup=project_picker_keyboard(projects, page=0, mode="pick"),
-    )
+    await message.answer('Выберите проект кнопкой ниже.', reply_markup=project_picker_keyboard(projects))
 
 
 @router.message(WorkState.waiting_past_month_hours)
@@ -2489,6 +2477,7 @@ async def handle_past_month_expense_amount(message: Message, state: FSMContext):
         'Проверьте запрос перед отправкой администратору:',
         f"Дата: {request_date:%d.%m.%Y}",
         'Тип записи: Расход',
+        f"Проект: {data.get('project')}",
         f"Описание расхода: {data['expense_type']}",
         f"Сумма: {amount}",
     ]
@@ -2727,6 +2716,41 @@ async def show_summary(message: Message, state: FSMContext):
 @router.callback_query()
 async def callbacks(callback: CallbackQuery, state: FSMContext):
     data = callback.data
+
+    if data == 'admin_past_requests' or data.startswith(('past_approve_', 'past_reject_')):
+        if not is_admin_callback(callback):
+            await callback.answer('Недостаточно прав.', show_alert=True)
+            return
+        await callback.answer()
+        if data == 'admin_past_requests':
+            await show_past_requests(callback.message)
+            return
+        try:
+            request_id = int(data.rsplit('_', 1)[1])
+            result_text = await process_request_decision(request_id, data.startswith('past_approve_'), f'telegram:{callback.from_user.id}')
+        except ValueError as exc:
+            await callback.message.answer(str(exc))
+            return
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.answer(result_text)
+        return
+
+    if data == "admin_sync_projects":
+        if not is_admin_callback(callback):
+            await callback.answer('Недостаточно прав.', show_alert=True)
+            return
+        await callback.answer()
+        try:
+            result = await run_sync(sync_projects)
+        except ValueError as exc:
+            await callback.message.answer(str(exc))
+            return
+        except Exception:
+            logging.exception("Yougile sync requested by administrator failed")
+            await callback.message.answer("Не удалось обновить проекты Yougile. Локальный справочник сохранён.")
+            return
+        await callback.message.answer(f"Проекты Yougile обновлены: {result['synced']}.")
+        return
 
     if data.startswith(("approve_user_", "reject_user_", "approve_expense_", "reject_expense_")):
         if callback.message.chat.id != ADMIN_CHAT_ID or not is_admin(callback.from_user.id):
@@ -3362,7 +3386,7 @@ async def callbacks(callback: CallbackQuery, state: FSMContext):
 
         await callback.answer()
         await state.clear()
-        await state.update_data(worker_id=worker_id)
+        await state.update_data(worker_id=worker_id, past_request_key=str(uuid.uuid4()))
         await state.set_state(WorkState.waiting_past_month_date)
         await callback.message.answer(
             'Введите полную дату из прошлого месяца в формате ДД.ММ.ГГГГ.\n'
@@ -3406,9 +3430,9 @@ async def callbacks(callback: CallbackQuery, state: FSMContext):
         if not projects:
             await callback.answer('Список проектов пуст.', show_alert=True)
             if current_state == WorkState.waiting_past_month_project.state:
-                await state.update_data(manual_project_entry=True, standflow_project_id=None)
+                await state.update_data(manual_project_entry=False, project_id=None, standflow_project_id=None)
                 await callback.message.answer(
-                    'Сейчас нет активных проектов. Введите название проекта вручную.',
+                    'Нет активных проектов. Обратитесь к администратору.',
                     reply_markup=back_to_menu_keyboard(),
                 )
             else:
@@ -3424,27 +3448,18 @@ async def callbacks(callback: CallbackQuery, state: FSMContext):
         return
 
     if data.startswith("project_other_page_"):
-        await callback.answer()
-        current_state = await state.get_state()
-        await state.update_data(manual_project_entry=True, standflow_project_id=None)
-        if current_state == WorkState.waiting_past_month_project.state:
-            await callback.message.answer(
-                'Введите название проекта вручную.',
-                reply_markup=back_to_menu_keyboard(),
-            )
-        else:
-            await callback.message.answer(
-                'Введите название проекта вручную.',
-                reply_markup=back_to_menu_keyboard(),
-            )
+        await callback.answer("Выберите проект из справочника. Новый проект добавляет администратор.", show_alert=True)
         return
 
     if data.startswith("project_pick_"):
         raw = data.removeprefix("project_pick_")
         project_id = int(raw.rsplit("_page_", 1)[0])
         page = int(raw.rsplit("_page_", 1)[1]) if "_page_" in raw else 0
-        project = await run_sync(get_project_by_id, project_id)
         current_state = await state.get_state()
+        if current_state not in {WorkState.waiting_project.state, WorkState.waiting_past_month_project.state}:
+            await callback.answer("Выбор проекта уже завершён.")
+            return
+        project = await run_sync(get_project_by_id, project_id)
         if not project or not project[2]:
             await callback.answer('Проект больше не активен.', show_alert=True)
             projects = await run_sync(get_active_projects)
@@ -3454,9 +3469,9 @@ async def callbacks(callback: CallbackQuery, state: FSMContext):
                 )
             else:
                 if current_state == WorkState.waiting_past_month_project.state:
-                    await state.update_data(manual_project_entry=True, standflow_project_id=None)
+                    await state.update_data(manual_project_entry=False, project_id=None, standflow_project_id=None)
                     await callback.message.answer(
-                        'Проект больше не активен. Введите название проекта вручную.',
+                        'Нет активных проектов. Обратитесь к администратору.',
                         reply_markup=back_to_menu_keyboard(),
                     )
                 else:
@@ -3469,7 +3484,13 @@ async def callbacks(callback: CallbackQuery, state: FSMContext):
             return
 
         await callback.answer()
-        await state.update_data(project=project[1], standflow_project_id=project[0], manual_project_entry=False)
+        await state.update_data(project=project[1], project_id=project[0], standflow_project_id=project[0], manual_project_entry=False)
+        form = await state.get_data()
+        if form.get("place") == "Расходы" or form.get("entry_type") == "expense":
+            target = WorkState.waiting_past_month_expense_description if current_state == WorkState.waiting_past_month_project.state else WorkState.waiting_expense_type
+            await state.set_state(target)
+            await callback.message.answer("Напишите краткое описание расхода.", reply_markup=back_to_menu_keyboard())
+            return
         if current_state == WorkState.waiting_past_month_project.state:
             await state.set_state(WorkState.waiting_past_month_hours)
             await callback.message.answer('Укажите, пожалуйста, количество часов по этому монтажу.', reply_markup=back_to_menu_keyboard())
@@ -3481,26 +3502,26 @@ async def callbacks(callback: CallbackQuery, state: FSMContext):
     if data == "place_install":
         await callback.answer()
         projects = await run_sync(get_active_projects)
-        await state.update_data(place='Монтаж', standflow_project_id=None, manual_project_entry=False)
+        await state.update_data(place='Монтаж', project_id=None, standflow_project_id=None, manual_project_entry=False)
         if not projects:
-            await state.update_data(manual_project_entry=True, standflow_project_id=None)
+            await state.update_data(manual_project_entry=False, project_id=None, standflow_project_id=None)
             await state.set_state(WorkState.waiting_project)
             await callback.message.answer(
                 'Сейчас нет активных проектов для монтажа.\n'
-                'Введите название проекта вручную.',
+                'Выберите проект из справочника. Обратитесь к администратору.',
                 reply_markup=back_to_menu_keyboard(),
             )
             return
         await state.set_state(WorkState.waiting_project)
         await callback.message.answer(
-            'Для монтажа выберите проект кнопкой ниже.',
+            'Выберите проект кнопкой ниже.',
             reply_markup=project_picker_keyboard(projects, page=0, mode="pick"),
         )
         return
 
     if data == "place_shift":
         await callback.answer()
-        await state.update_data(place='Смена', project=None, standflow_project_id=None)
+        await state.update_data(place='Смена', project=None, project_id=None, standflow_project_id=None)
         await state.set_state(WorkState.waiting_hours)
         await callback.message.answer('Укажите количество часов по смене.')
         return
@@ -3510,6 +3531,8 @@ async def callbacks(callback: CallbackQuery, state: FSMContext):
         await state.update_data(
             place='Расходы',
             project=None,
+            project_id=None,
+            manual_project_entry=False,
             hours=None,
             receipt_kind=None,
             receipt_file_id=None,
@@ -3517,41 +3540,49 @@ async def callbacks(callback: CallbackQuery, state: FSMContext):
             source_platform="telegram",
             source_peer_id=callback.message.chat.id,
         )
-        await state.set_state(WorkState.waiting_expense_type)
-        await callback.message.answer('Напишите краткое описание расхода.')
+        projects = await run_sync(get_active_projects)
+        if not projects:
+            await callback.message.answer('Нет активных проектов. Обратитесь к администратору.', reply_markup=work_type_keyboard())
+            return
+        await state.set_state(WorkState.waiting_project)
+        await callback.message.answer('Выберите проект для расхода.', reply_markup=project_picker_keyboard(projects))
         return
 
     if data == "past_place_install":
         await callback.answer()
         projects = await run_sync(get_active_projects)
-        await state.update_data(entry_type="install", manual_project_entry=False)
+        await state.update_data(entry_type="install", project_id=None, manual_project_entry=False)
         if not projects:
-            await state.update_data(manual_project_entry=True, standflow_project_id=None)
+            await state.update_data(manual_project_entry=False, project_id=None, standflow_project_id=None)
             await state.set_state(WorkState.waiting_past_month_project)
             await callback.message.answer(
-                'Сейчас нет активных проектов. Введите название проекта вручную.',
+                'Нет активных проектов. Обратитесь к администратору.',
                 reply_markup=back_to_menu_keyboard(),
             )
             return
         await state.set_state(WorkState.waiting_past_month_project)
         await callback.message.answer(
-            'Для монтажа выберите проект кнопкой ниже.',
+            'Выберите проект кнопкой ниже.',
             reply_markup=project_picker_keyboard(projects, page=0, mode="pick"),
         )
         return
 
     if data == "past_place_shift":
         await callback.answer()
-        await state.update_data(entry_type="shift", project=None, manual_project_entry=False)
+        await state.update_data(entry_type="shift", project=None, project_id=None, manual_project_entry=False)
         await state.set_state(WorkState.waiting_past_month_hours)
         await callback.message.answer('Укажите количество часов по смене.', reply_markup=back_to_menu_keyboard())
         return
 
     if data == "past_place_expense":
         await callback.answer()
-        await state.update_data(entry_type="expense", project=None, hours=None)
-        await state.set_state(WorkState.waiting_past_month_expense_description)
-        await callback.message.answer('Напишите краткое описание расхода.', reply_markup=back_to_menu_keyboard())
+        projects = await run_sync(get_active_projects)
+        if not projects:
+            await callback.message.answer('Нет активных проектов. Обратитесь к администратору.', reply_markup=back_to_menu_keyboard())
+            return
+        await state.update_data(entry_type="expense", project=None, project_id=None, hours=None, manual_project_entry=False)
+        await state.set_state(WorkState.waiting_past_month_project)
+        await callback.message.answer('Выберите проект для расхода.', reply_markup=project_picker_keyboard(projects))
         return
 
     if data == "expense_skip_receipt":
@@ -3653,10 +3684,15 @@ async def callbacks(callback: CallbackQuery, state: FSMContext):
         form_data = await state.get_data()
         current_state = await state.get_state()
         if current_state == WorkState.confirm_past_month.state:
-            await send_past_month_request_to_admins(callback.message, state, worker_id)
+            try:
+                await send_past_month_request_to_admins(callback.message, state, worker_id)
+            except ValueError as exc:
+                await callback.answer()
+                await callback.message.answer(str(exc), reply_markup=back_to_menu_keyboard())
+                return
             await callback.answer()
             await callback.message.answer(
-                'Запрос отправлен администраторам. Они внесут данные в архивный лист прошлого месяца вручную.',
+                'Заявка отправлена администраторам. После одобрения данные появятся в базе и архивном отчёте.',
                 reply_markup=back_to_menu_keyboard(),
             )
             await state.clear()
@@ -3712,6 +3748,7 @@ async def callbacks(callback: CallbackQuery, state: FSMContext):
                 form_data.get("amount"),
                 form_data.get("expense_type"),
                 bool(saved_receipt or form_data.get("receipt_file_id")),
+                project_name=form_data.get("project"),
             )
             telegram_sent = False
             if form_data.get("receipt_kind") and form_data.get("receipt_file_id"):

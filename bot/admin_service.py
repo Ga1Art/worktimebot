@@ -1,4 +1,4 @@
-﻿from datetime import date
+from datetime import date
 
 from bot.shared_text import format_adjustments, format_worker_rates
 from services.db import (
@@ -9,6 +9,7 @@ from services.db import (
     deactivate_project,
     delete_worker,
     get_active_projects,
+    get_active_projects_with_stats,
     get_worker_bonuses,
     get_worker_by_id,
     get_worker_contacts_by_id,
@@ -163,13 +164,13 @@ def get_active_projects_result():
 
 
 def get_active_projects_text_result():
-    rows = get_active_projects()
+    rows = get_active_projects_with_stats()
     if not rows:
         return 'Сейчас нет активных проектов.'
 
     lines = ['Активные проекты:']
-    for project_id, project_name in rows:
-        lines.append(f"{project_id}. {project_name}")
+    for project_id, project_name, participants, hours, approved, pending, rejected in rows:
+        lines.append(f"{project_id}. {project_name} | Монтажи: {hours} ч. | Участников: {participants} | Расходы: {approved} | Ожидают: {pending} | Отклонены: {rejected}")
     return "\n".join(lines)
 
 

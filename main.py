@@ -23,9 +23,11 @@ from services.google_sheets import (
     sync_monthly_report_to_current_sheet,
 )
 from services.monthly_closing import close_month_tracked, run_month_close_scheduler
-from services.db import get_connection
+from services.db import get_connection, get_project_accounting_report
 from services.reporting import build_monthly_report
 from services.runtime_lock import TELEGRAM_RUNTIME_LOCK
+from services.yougile import sync_projects, run_project_sync_scheduler
+from services.past_month_requests import run_past_request_archive_scheduler
 
 print("BOT STARTED")
 
@@ -114,6 +116,29 @@ app = FastAPI()
 @app.get("/")
 def root():
     return {"status": "ok"}
+
+
+@app.post("/projects-sync-yougile")
+def projects_sync_yougile(x_api_key: str = Header(None)):
+    if not API_KEY or x_api_key != API_KEY:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    try:
+        return {"status": "ok", **sync_projects()}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logging.exception("Project sync failed")
+        raise HTTPException(status_code=502, detail="Не удалось синхронизировать проекты Yougile.") from exc
+
+
+@app.get("/projects/{project_id}/report")
+def project_report(project_id: int, x_api_key: str = Header(None)):
+    if not API_KEY or x_api_key != API_KEY:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    report = get_project_accounting_report(project_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return report
 
 
 @app.get("/manager-table")
@@ -307,6 +332,8 @@ async def main():
         tasks = [
             server.serve(),
             run_month_close_scheduler("telegram_api"),
+            run_project_sync_scheduler(),
+            run_past_request_archive_scheduler(),
         ]
         if ENABLE_TELEGRAM_BOT:
             logging.info("Telegram bot and FastAPI started...")

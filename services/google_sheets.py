@@ -51,11 +51,11 @@ HEADER_ALIASES = {
     "project_id": ("project_id", "id проекта"),
     "project_name": ("project_name", "название проекта", "проект"),
     "participants_count": ("participants_count", "участников", "количество участников"),
-    "total_hours": ("total_hours", "всего часов", "часы всего"),
+    "total_hours": ("total_hours", "всего часов", "часы всего", "часы монтажей"),
 }
 DISPLAY_HEADERS = {
     "rates": ["ID сотрудника", "Сотрудник", "Ставка за смену", "Ставка за монтаж"],
-    "projects": ["ID проекта", "Название проекта", "Участников", "Всего часов"],
+    "projects": ["ID проекта", "Название проекта", "Участников", "Часы монтажей", "Подтверждённые расходы", "Ожидающие расходы", "Отклонённые расходы"],
     "bonuses": ["ID сотрудника", "Сотрудник", "Дата премии", "Сумма", "Описание"],
     "penalties": ["ID сотрудника", "Сотрудник", "Дата штрафа", "Сумма", "Описание"],
 }
@@ -313,8 +313,8 @@ def build_rates_sheet_rows():
 
 def build_projects_sheet_rows():
     rows = [DISPLAY_HEADERS["projects"]]
-    for project_id, project_name, participants_count, total_hours in get_active_projects_with_stats():
-        rows.append([project_id, project_name, participants_count, float(total_hours or 0)])
+    for project_id, project_name, participants_count, total_hours, approved, pending, rejected in get_active_projects_with_stats():
+        rows.append([project_id, project_name, participants_count, float(total_hours or 0), float(approved), float(pending), float(rejected)])
     return rows
 
 
